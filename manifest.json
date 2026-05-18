@@ -1,18 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "工程日志智能填充 (Native版)",
-  "version": "10.8",
-  "description": "适配 Bsoft 系统的日志自动填充工具",
+  "name": "工程日志智能填充",
+  "version": "10.8.1",
+  "description": "自动填充工程日志的选项，简化录入日志时需要的操作。by IHIYA",
   "author": "IHIYA",
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://office.bsoft.com.cn:5005/*"],
+      "matches": [
+        "https://office.bsoft.com.cn:5005/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
-  ],
-  "action": {
-    "default_title": "工程日志助手"
-  }
+  ]
 }
