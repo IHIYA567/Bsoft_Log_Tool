@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "工程日志智能填充",
-  "version": "10.8.1",
-  "description": "自动填充工程日志的选项，简化录入日志时需要的操作。by IHIYA",
+  "name": "Bsoft 日志自动填充工具 (Bsoft_Log_Tool)",
+  "version": "2.1",
+  "description": "专为 Bsoft 系统供应商及实施团队开发的日志录入辅助插件，支持一键秒级全自动填充表单。",
   "author": "IHIYA",
   "permissions": [
     "storage"
@@ -10,10 +10,12 @@
   "content_scripts": [
     {
       "matches": [
-        "https://office.bsoft.com.cn:5005/*"
+        "*://office.bsoft.com.cn/*"
       ],
-      "js": ["content.js"],
-      "run_at": "document_idle"
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
     }
   ]
 }
