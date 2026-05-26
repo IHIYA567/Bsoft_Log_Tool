@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bsoft 日志自动填充工具 (Bsoft_Log_Tool)",
-  "version": "2.1",
+  "version": "2.1.1",
   "description": "专为 Bsoft 系统供应商及实施团队开发的日志录入辅助插件，支持一键秒级全自动填充表单。",
   "author": "IHIYA",
   "permissions": [

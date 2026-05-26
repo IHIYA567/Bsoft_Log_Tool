@@ -207,10 +207,10 @@
         clickTravelCheckbox(userConfig.fill_travel, showFlash);
         clickButtonByLabelText('住宿情况', DICTS.houseType[userConfig.target_houseType], showFlash);
         
-        // 2. 直接无视任何标签拦截，直接点击指定的“计划”项（计划内 或 计划外）
+        // 2. 🌟【调整顺序】先模拟点击“计划”项（计划内 或 计划外）
         clickButtonByLabelText('计划', DICTS.plan[userConfig.target_plan], showFlash);
         
-        // 🌟 【核心修复】直接无条件点击“范围”对应的合同内/合同外，确保绝对触发勾选
+        // 🌟【调整顺序】再模拟点击“范围”对应的合同内/合同外
         clickButtonByLabelText('范围', DICTS.fgWithinContract[userConfig.target_fgWithinContract], showFlash);
 
         // 3. 执行其余通用下拉或单选
@@ -231,11 +231,12 @@
         const houseOk = checkItemStatus('住宿情况', DICTS.houseType[userConfig.target_houseType]);
         matrixResults.push({ name: '🏨 住宿安排', status: houseOk ? '✅ 匹配成功' : '⚡ 差异' });
         
-        const planOk = checkItemStatus('计划', DICTS.plan[userConfig.target_plan]);
-        matrixResults.push({ name: '📅 计划类型', status: planOk ? '✅ 匹配成功' : '⚡ 差异' });
-
+        // 🌟【调整监控矩阵显示位置】将合同范围放在计划类型上方
         const scopeOk = checkItemStatus('范围', DICTS.fgWithinContract[userConfig.target_fgWithinContract]);
         matrixResults.push({ name: '📌 合同范围', status: scopeOk ? '✅ 匹配成功' : '⚡ 差异' });
+
+        const planOk = checkItemStatus('计划', DICTS.plan[userConfig.target_plan]);
+        matrixResults.push({ name: '📅 计划类型', status: planOk ? '✅ 匹配成功' : '⚡ 差异' });
 
         const tasks = [{ key: 'role', title: '角色', icon: '👤' }, { key: 'model', title: '方式', icon: '🌐' }, { key: 'category', title: '类别', icon: '📁' }, { key: 'result', title: '结果', icon: '🏁' }];
         tasks.forEach(task => { 
@@ -298,7 +299,7 @@
         }, 4500);
     }
 
-    // 🌟 关于弹窗
+    // 关于弹窗
     function showAboutModal() {
         const oldModal = document.getElementById('fill-about-modal');
         if (oldModal && oldModal.parentNode) {
