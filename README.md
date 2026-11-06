@@ -74,7 +74,7 @@
 * **作者**：IHIYA
 * **身份**：医疗信息系统供应商 / 项目经理
 * **专注领域**：医院信息系统（HIS）、Oracle 数据库运维与 PL/SQL 性能优化、医疗数据治理、 legacy 软件维护、工作流自动化。
-* **开源地址**：[点击访问 GitHub 仓库](https://github.com/wubai67-debug/Bsoft_Log_Tool)
+* **开源地址**：[点击访问 GitHub 仓库](https://github.com/IHIYA567/Bsoft_Log_Tool)
 
 ---
 
