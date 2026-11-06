@@ -14,8 +14,8 @@
 
     // 默认兜底配置
     let userConfig = {
-        auto_run: true, 
-        fill_workload: true, workload_val: '8.0',
+        auto_run: true,
+        workload_val: '8.0',
         fill_travel: true,
         init_delay: 1,
         target_houseType: '3', target_fgWithinContract: '1',
@@ -23,7 +23,283 @@
         target_model: '1', target_category: '5', target_result: '0'
     };
 
-    let isWorkflowActive = false; // 严格的写权限生命周期锁
+    // ==========================================================================
+    // 诊断日志：常驻内存滚动记录，出问题时一键导出，不用再远程抓静态资源
+    // 只记录容器/字段/状态等技术信息，不采集任何业务或患者数据
+    // ==========================================================================
+    const DIAG_LIMIT = 500;
+    const diagLines = [];
+    const diagStart = Date.now();
+    let lastMatrixSnapshot = [];
+
+    function diag(tag, msg) {
+        try {
+            diagLines.push(`[${String(Date.now() - diagStart).padStart(7)}ms] ${tag.padEnd(10)} ${msg}`);
+            if (diagLines.length > DIAG_LIMIT) diagLines.shift();
+        } catch (e) {}
+    }
+
+    function buildDiagnosticReport() {
+        const lines = [
+            'Bsoft 日志自动填充工具 V2.3.1 — 诊断报告',
+            `生成时间: ${new Date().toLocaleString()}`,
+            `页面 URL: ${location.href}`,
+            `浏览器: ${navigator.userAgent}`,
+        ];
+        try { lines.push(`容器: ${describeFormContainer()} | 可查询根 ${getDOMRoots(true).length} 个`); } catch (e) {}
+        lines.push(`配置: ${JSON.stringify(userConfig)}`);
+        lines.push(`最近一次矩阵: ${lastMatrixSnapshot.map(r => `${r.name}=${r.status}`).join(' / ') || '(无)'}`);
+        lines.push(`写锁计数: ${_writeLocks}`);
+        lines.push('---- 事件时间线 ----');
+        lines.push(...diagLines);
+        return lines.join('\n');
+    }
+
+    // 写权限用引用计数，自动填充与设置面板单字段操作各持一把锁，
+    // 避免并发时一方提前释放掉另一方的写权限（原来共用布尔量会互相踩）。
+    let _writeLocks = 0;
+    let _workflowRunning = false;
+    const acquireWriteLock = () => { _writeLocks++; diag('LOCK', `获取，当前 ${_writeLocks}`); return _writeLocks; };
+    const releaseWriteLock = () => { _writeLocks = Math.max(0, _writeLocks - 1); diag('LOCK', `释放，剩余 ${_writeLocks}`); return _writeLocks; };
+    const canWrite = () => _writeLocks > 0;
+    // 不做排队互斥：设置改动立即执行。自动填充的补填轮读同一份 userConfig，
+    // 两者最终收敛到用户最新选择；排队只会增加状态机和「永久卡住」的风险。
+
+    // ==========================================================================
+    // 【V2.2 核心】微前端(无界 wujie)适配层
+    //
+    // 新地址 /vueoffice/:path 是 Vue3 + Vite 外壳，通过 WujieVue 把旧的
+    // vue-antd-pro 子应用(/office/#/:path)挂载到 <wujie-app> 的 Shadow DOM。
+    // document.querySelectorAll 不会穿透 shadowRoot，所以 V2.1 的点击和状态
+    // 扫描全部落空 -> 面板全提示「⚡ 差异」。
+    // 这里统一收集所有可查询的文档根，表单操作只在含 ant 表单的根内进行。
+    // 兼容：新微前端页 / 旧地址直连 / wujie 降级(iframe)模式。
+    // ==========================================================================
+    let _rootCache = null, _rootCacheTime = 0;
+    let _formRootCache = null, _formRootCacheTime = 0;
+
+    function getDOMRoots(force = false) {
+        if (!force && _rootCache && Date.now() - _rootCacheTime < 200) return _rootCache;
+        const roots = [];
+        const seen = new Set();
+        const push = (r) => { if (r && !seen.has(r)) { seen.add(r); roots.push(r); } };
+        push(document);
+
+        // 递归收集所有 open shadowRoot（wujie-app 及其它自定义元素）
+        const scanHosts = (root, depth) => {
+            if (depth > 3 || !root || !root.querySelectorAll) return;
+            let nodes = [];
+            try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+            for (let i = 0; i < nodes.length; i++) {
+                const sr = nodes[i].shadowRoot;
+                if (sr) { push(sr); scanHosts(sr, depth + 1); }
+            }
+        };
+        scanHosts(document, 0);
+
+        // 同源 iframe（wujie 降级模式 / 其它 iframe 套壳）
+        let frames = [];
+        try { frames = document.querySelectorAll('iframe'); } catch (e) {}
+        for (let i = 0; i < frames.length; i++) {
+            try {
+                const d = frames[i].contentDocument;
+                if (d) { push(d); scanHosts(d, 1); }
+            } catch (e) { /* 跨域 iframe，忽略 */ }
+        }
+
+        _rootCache = roots;
+        _rootCacheTime = Date.now();
+        return roots;
+    }
+
+    function queryAll(selector, roots) {
+        const list = roots || getDOMRoots();
+        const out = [];
+        for (let i = 0; i < list.length; i++) {
+            if (!list[i].querySelectorAll) continue;
+            try {
+                const nodes = list[i].querySelectorAll(selector);
+                for (let j = 0; j < nodes.length; j++) out.push(nodes[j]);
+            } catch (e) {}
+        }
+        return out;
+    }
+
+    // 只操作真正含表单的文档根，避免误点 Vue3 外壳上的菜单/按钮
+    function getFormRoots(force = false) {
+        if (!force && _formRootCache && Date.now() - _formRootCacheTime < 300) return _formRootCache;
+        const all = getDOMRoots(force);
+        const formRoots = all.filter(r => {
+            try { return !!r.querySelector('.ant-form-item, .ant-radio-wrapper, input.ant-input-number-input'); }
+            catch (e) { return false; }
+        });
+        const result = formRoots.length ? formRoots : all;
+        _formRootCache = result;
+        _formRootCacheTime = Date.now();
+        return result;
+    }
+
+    // 探测真正含 ant 表单的文档根，供「等待就绪」与「容器说明」共用，
+    // 覆盖主文档 / 所有 open Shadow DOM / 同源 iframe（wujie 降级模式）
+    function detectFormRoots() {
+        return getDOMRoots(true).filter(r => {
+            try { return !!r.querySelector('.ant-form-item'); } catch (e) { return false; }
+        });
+    }
+
+    function hasReadyForm() { return detectFormRoots().length > 0; }
+
+    function waitForFormReady(callback) {
+        const TIMEOUT_MS = 20000;
+        const start = Date.now();
+        const tick = () => {
+            if (hasReadyForm()) { getFormRoots(true); callback(true); return; }
+            if (Date.now() - start >= TIMEOUT_MS) { callback(false); return; }
+            setTimeout(tick, 250);
+        };
+        tick();
+    }
+
+    // Shadow DOM 内的事件必须 composed 才能冒泡到子应用代理的 document
+    function makeEvent(el, type) {
+        let win = window;
+        try { win = (el && el.ownerDocument && el.ownerDocument.defaultView) || window; } catch (e) {}
+        try { return new win.Event(type, { bubbles: true, composed: true }); }
+        catch (e2) { return new Event(type, { bubbles: true, composed: true }); }
+    }
+
+    // 直接点原生 input 最可靠：一定能触发 change，绕开 label 的事件委托
+    // strategy 用于单字段重试逐步升级：0=原生 input.click，1=点 label，2=完整鼠标事件序列
+    function fireOptionClick(opt, strategy = 0) {
+        let input = null;
+        try {
+            input = (opt.matches && opt.matches('input'))
+                ? opt
+                : opt.querySelector('input[type="radio"], input[type="checkbox"]');
+        } catch (e) {}
+        try {
+            if (strategy >= 2) {
+                const win = (opt.ownerDocument && opt.ownerDocument.defaultView) || window;
+                const mouse = (type) => new win.MouseEvent(type, { bubbles: true, composed: true, cancelable: true });
+                opt.dispatchEvent(mouse('mousedown'));
+                opt.dispatchEvent(mouse('mouseup'));
+                opt.dispatchEvent(mouse('click'));
+                if (input) input.dispatchEvent(makeEvent(input, 'change'));
+                return;
+            }
+            if (strategy === 1) { opt.click(); return; }
+            if (input && !input.disabled && !input.readOnly) input.click();
+            else opt.click();
+        } catch (e) { try { opt.click(); } catch (e2) {} }
+    }
+
+    // 多选一的选中态判定（兼容 ant-design / element / 原生）
+    function isOptionChecked(opt) {
+        if (!opt) return false;
+        try {
+            const cls = typeof opt.className === 'string' ? opt.className : '';
+            if (/ant-radio-button-wrapper-checked|ant-radio-wrapper-checked|ant-btn-primary|is-checked|is-active|\bchecked\b|\bactive\b/.test(cls)) return true;
+            if (opt.getAttribute && opt.getAttribute('aria-checked') === 'true') return true;
+            if (opt.querySelector('.ant-radio-checked, .ant-checkbox-checked')) return true;
+            // ant 组件必须认 Vue 渲染出来的 checked 类。原生 input.checked 在点击后会立刻变 true，
+            // 用它判成功会造成「假同步」：界面看着对了、框架值没更新，还跳过了重试。
+            const isAntControl = /ant-radio|ant-checkbox|ant-btn/.test(cls) || !!opt.querySelector('.ant-radio, .ant-checkbox');
+            if (!isAntControl) {
+                const inp = opt.querySelector('input[type="radio"], input[type="checkbox"]');
+                if (inp) return !!inp.checked;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function isOptionDisabled(opt) {
+        try {
+            const cls = typeof opt.className === 'string' ? opt.className : '';
+            if (/disabled|is-disabled/.test(cls)) return true;
+            if (opt.disabled === true || opt.getAttribute('aria-disabled') === 'true') return true;
+            const inp = opt.querySelector('input');
+            if (inp && inp.disabled) return true;
+        } catch (e) {}
+        return false;
+    }
+
+    // 表单定位：标签 -> 表单项容器 -> 候选项。
+    // 点击、状态扫描、可用性探测共用这一份实现，避免三份复制粘贴的 DOM 遍历。
+    const FIELD_LABEL_SELECTOR = 'label, span, .ant-form-item-label label, .ant-col-6';
+    const FIELD_OPTION_SELECTOR = '.ant-radio-button-wrapper, .ant-radio-wrapper, label.ant-checkbox-wrapper, .ant-btn, button';
+    const normFieldLabel = (s) => (s || '').replace(/\s+/g, '').replace(/[*：:]/g, '');
+
+    function findFieldOptions(labelTitle, targetText, mode) {
+        const labels = queryAll(FIELD_LABEL_SELECTOR, getFormRoots());
+        const cleanTitle = labelTitle.replace(/\s+/g, '');
+        const out = [];
+        for (const l of labels) {
+            const t = normFieldLabel(l.innerText || l.textContent || '');
+            const matched = mode === 'exact' ? (t === cleanTitle)
+                : mode === 'fuzzy' ? (t.includes(cleanTitle) && t.length <= cleanTitle.length + 6)
+                : (t === cleanTitle || t.includes(cleanTitle));
+            if (!matched) continue;
+            const container = l.closest('.ant-form-item') || l.closest('.ant-row') || (l.parentElement && l.parentElement.parentElement);
+            if (!container || !container.querySelectorAll) continue;
+            const options = container.querySelectorAll(FIELD_OPTION_SELECTOR);
+            for (let i = 0; i < options.length; i++) {
+                const opt = options[i];
+                const text = (opt.innerText || opt.textContent || '').trim();
+                if (text === targetText || text.includes(targetText)) out.push(opt);
+            }
+        }
+        return out;
+    }
+
+    // 三态：ok=已同步 / retry=选项可点但没生效 / unavailable=项目本身没这个选项
+    // 场景：部分项目没有「合同外」选项，或该 radio 被 disabled —— 这不是同步失败，
+    // 不能当成差异反复点击并给红框。
+    function fieldStatus(labelTitle, targetText) {
+        try {
+            const opts = findFieldOptions(labelTitle, targetText, 'any');
+            const disabled = opts.filter(isOptionDisabled).length;
+            const st = opts.some(isOptionChecked) ? 'ok' : ((!opts.length || disabled) ? 'unavailable' : 'retry');
+            diag('FIELD', `${labelTitle} → ${targetText}: 命中 ${opts.length} 个选项, 禁用 ${disabled}, 状态=${st}`);
+            return st;
+        } catch (e) {
+            diag('FIELD', `${labelTitle} → ${targetText}: 扫描异常 ${e.message}`);
+            return 'unavailable';
+        }
+    }
+
+    function showFieldHint(text) {
+        const id = 'fill-field-hint';
+        let el = document.getElementById(id);
+        if (!el) {
+            el = document.createElement('div');
+            el.id = id;
+            Object.assign(el.style, { position: 'fixed', top: '18px', left: '50%', transform: 'translateX(-50%)', backgroundColor: 'rgba(0,0,0,0.8)', color: '#fff', padding: '9px 14px', borderRadius: '8px', fontSize: '12px', zIndex: '2147483647', maxWidth: '80vw', lineHeight: '1.4' });
+            document.body.appendChild(el);
+        }
+        el.textContent = text;
+        clearTimeout(el._hideTimer);
+        el._hideTimer = setTimeout(() => { if (el && el.parentNode) el.parentNode.removeChild(el); }, 2400);
+    }
+
+    function describeFormContainer() {
+        const roots = detectFormRoots();
+        if (!roots.length) return '🔍 容器：未检测到日志表单';
+        if (roots.some(r => r !== document)) return '🔍 容器：微前端 Shadow DOM';
+        return '🔍 容器：当前页面文档';
+    }
+
+    function showWaitingToast() {
+        const id = 'fill-waiting-toast';
+        let el = document.getElementById(id);
+        if (!el) {
+            el = document.createElement('div');
+            el.id = id;
+            Object.assign(el.style, { position: 'fixed', bottom: '140px', right: '30px', backgroundColor: 'rgba(0,0,0,0.78)', color: '#fff', padding: '8px 12px', borderRadius: '8px', fontSize: '12px', zIndex: '2147483646' });
+            document.body.appendChild(el);
+        }
+        el.textContent = '⏳ 正在等待微前端日志表单加载…';
+        return () => { if (el && el.parentNode) el.parentNode.removeChild(el); };
+    }
 
     function saveConfig() {
         if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
@@ -60,91 +336,56 @@
     function applyStrongFlash(el) { if (!el) return; el.style.transition = 'all 0.3s ease'; el.style.boxShadow = '0 0 12px #52c41a'; setTimeout(() => { el.style.boxShadow = ''; }, 600); }
     function addClickEffect(btn) { btn.addEventListener('mousedown', () => btn.classList.add('fill-btn-active')); const removeEffect = () => btn.classList.remove('fill-btn-active'); btn.addEventListener('mouseup', removeEffect); btn.addEventListener('mouseleave', removeEffect); }
 
-    // 3. 基础组件控制与检测
-    function clickButtonByLabelText(labelTitle, targetText, showFlash = true) {
-        if (!isWorkflowActive) return null; 
+    // 3. 基础组件控制与检测（全量走适配层，可穿透 Shadow DOM）
+    function clickButtonByLabelText(labelTitle, targetText, showFlash = true, strategy = 0) {
+        if (!canWrite()) return null;
         try {
-            const labels = Array.from(document.querySelectorAll('label, span, .ant-form-item-label label, .ant-col-6'));
-            const cleanTargetTitle = labelTitle.replace(/\s+/g, '');
+            // 先精确匹配标签文本，找不到再退到包含匹配，减少误点
+            let options = findFieldOptions(labelTitle, targetText, 'exact');
+            if (!options.length) options = findFieldOptions(labelTitle, targetText, 'fuzzy');
             let clickedEl = null;
-
-            labels.forEach(l => {
-                const actualLabelText = l.innerText.replace(/\s+/g, '').replace(/[*：:]/g, '');
-                if (actualLabelText === cleanTargetTitle || actualLabelText.includes(cleanTargetTitle)) {
-                    const container = l.closest('.ant-form-item') || l.closest('.ant-row') || l.parentElement.parentElement;
-                    if (container) {
-                        const options = Array.from(container.querySelectorAll('.ant-radio-button-wrapper, .ant-radio-wrapper, label.ant-checkbox-wrapper, .ant-btn, button'));
-                        options.forEach(opt => {
-                            const optText = opt.innerText.trim() || opt.textContent.trim();
-                            if (optText === targetText || optText.includes(targetText)) {
-                                const isChecked = opt.classList.contains('ant-radio-button-wrapper-checked') || 
-                                                  opt.classList.contains('ant-radio-wrapper-checked') || 
-                                                  opt.classList.contains('ant-btn-primary') ||
-                                                  opt.querySelector('.ant-radio-checked, .ant-checkbox-checked');
-                                if (!isChecked) { opt.click(); }
-                                clickedEl = opt;
-                            }
-                        });
-                    }
-                }
-            });
+            for (const opt of options) {
+                if (!isOptionChecked(opt) && !isOptionDisabled(opt)) fireOptionClick(opt, strategy);
+                clickedEl = opt;
+            }
+            diag('CLICK', `${labelTitle} → ${targetText}: 命中 ${options.length} 个, 策略 ${strategy}`);
             if (clickedEl && showFlash) applyStrongFlash(clickedEl);
             return clickedEl;
-        } catch(e) { return null; }
-    }
-
-    function checkItemStatus(labelTitle, targetText) {
-        const labels = Array.from(document.querySelectorAll('label, span, .ant-form-item-label label'));
-        const cleanTargetTitle = labelTitle.replace(/\s+/g, '');
-        let isRealChecked = false;
-
-        labels.forEach(l => {
-            const actualLabelText = l.innerText.replace(/\s+/g, '').replace(/[*：:]/g, '');
-            if (actualLabelText === cleanTargetTitle || actualLabelText.includes(cleanTargetTitle)) {
-                const container = l.closest('.ant-form-item') || l.closest('.ant-row') || l.parentElement.parentElement;
-                if (container) {
-                    const options = Array.from(container.querySelectorAll('.ant-radio-button-wrapper, .ant-radio-wrapper, label.ant-checkbox-wrapper, .ant-btn, button'));
-                    options.forEach(opt => {
-                        const optText = opt.innerText.trim() || opt.textContent.trim();
-                        if (optText === targetText || optText.includes(targetText)) {
-                            if (opt.classList.contains('ant-radio-button-wrapper-checked') || 
-                                opt.classList.contains('ant-radio-wrapper-checked') || 
-                                opt.classList.contains('ant-btn-primary') ||
-                                opt.querySelector('.ant-radio-checked, .ant-checkbox-checked')) {
-                                isRealChecked = true;
-                            }
-                        }
-                    });
-                }
-            }
-        });
-        return isRealChecked;
+        } catch(e) { diag('CLICK', `${labelTitle} → ${targetText}: 点击异常 ${e.message}`); return null; }
     }
 
     function getTravelInputElement() {
-        const allElements = Array.from(document.querySelectorAll('span, label, div'));
-        for (let el of allElements) {
-            if (el.childNodes.length === 1 && el.innerText.trim() === '是否出差：') {
-                let nextEl = el.nextElementSibling;
-                if (nextEl && nextEl.tagName.toLowerCase() === 'input') return nextEl;
-                if (el.parentElement) {
-                    let inputInside = el.parentElement.querySelector('input[type="checkbox"]');
-                    if (inputInside) return inputInside;
-                }
+        const roots = getFormRoots();
+        const labels = queryAll('.ant-form-item-label label, .ant-form-item-label, label, span[slot="label"], .justify-label, .ant-col-6', roots);
+        for (const el of labels) {
+            const txt = (el.textContent || '').replace(/[\s*：:]/g, '');
+            if (txt !== '是否出差') continue;
+            const container = el.closest('.ant-form-item') || el.parentElement;
+            if (container && container.querySelector) {
+                const cb = container.querySelector('input[type="checkbox"]');
+                if (cb) return cb;
             }
         }
-        return document.querySelector('input[type="checkbox"]');
+        // 仅当页面恰好只有一个候选复选框时才用兜底。多个时宁可报「未找到控件」，
+        // 也不能默默点中「是否加班」之类的复选框，造成矩阵全绿但填错的假成功。
+        const wrapped = queryAll('.ant-checkbox input[type="checkbox"], label.ant-checkbox-wrapper input[type="checkbox"]', roots);
+        if (wrapped.length === 1) return wrapped[0];
+        diag('FIELD', `未找到「是否出差」控件（备用候选 ${wrapped.length} 个，已放弃兜底）`);
+        return null;
     }
 
     function clickTravelCheckbox(shouldCheck, showFlash = true) {
-        if (!isWorkflowActive) return false; 
+        if (!canWrite()) return false; 
         try {
             const inputEl = getTravelInputElement();
             if (!inputEl) return false;
             if (inputEl.checked !== shouldCheck) {
-                inputEl.checked = shouldCheck;
-                inputEl.dispatchEvent(new Event('click', { bubbles: true }));
-                inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+                inputEl.click(); // 原生点击会触发 change，让 ant-checkbox 同步 Vue 状态
+                if (inputEl.checked !== shouldCheck) {
+                    inputEl.checked = shouldCheck;
+                    inputEl.dispatchEvent(makeEvent(inputEl, 'click'));
+                    inputEl.dispatchEvent(makeEvent(inputEl, 'change'));
+                }
             }
             if (showFlash && inputEl.parentElement) applyStrongFlash(inputEl.parentElement);
             return inputEl.checked === shouldCheck;
@@ -153,35 +394,49 @@
 
     function checkTravelStatus() {
         const inputEl = getTravelInputElement();
-        return inputEl ? inputEl.checked : false;
+        return inputEl ? inputEl.checked : null;   // null = 控件未找到，区别于「未勾选」
     }
 
     // 4. 工时高兼容操作组件
     function getWorkloadInput() {
-        let correctInput = null;
-        const allInputs = document.querySelectorAll('input.ant-input-number-input');
-        allInputs.forEach(inp => {
-            const parent = inp.closest('.ant-form-item') || inp.parentElement.parentElement;
-            if (parent && (parent.innerText.includes('工时') || parent.textContent.includes('时') || parent.innerText.includes('h'))) {
-                if (inp.tagName.toLowerCase() === 'input' && inp.type !== 'textarea') { correctInput = inp; }
+        const roots = getFormRoots();
+        const labels = queryAll('label, span[slot="label"], .justify-label', roots);
+        for (const l of labels) {
+            const t = (l.textContent || '').replace(/[\s*：:]/g, '');
+            if (t !== '工时') continue;
+            const c = l.closest ? l.closest('.ant-form-item') : null;
+            if (c) {
+                const inp = c.querySelector('input.ant-input-number-input') || c.querySelector('input');
+                if (inp) return inp;
             }
-        });
-        if (!correctInput) correctInput = document.querySelector('input[aria-label="工时"]') || document.querySelector('.ant-input-number-input');
-        return correctInput;
+        }
+        // 同理：页面有多个数字输入框时不再取第一个，避免把工时填进别的字段
+        const numbered = queryAll('input.ant-input-number-input', roots);
+        if (numbered.length === 1) return numbered[0];
+        const labelled = queryAll('input[aria-label="工时"]', roots);
+        if (labelled.length === 1) return labelled[0];
+        diag('FIELD', `未找到「工时」输入框（备用候选 ${numbered.length} 个，已放弃兜底）`);
+        return null;
     }
 
     function fillWorkloadViaButtons(targetVal, showFlash = true) {
-        if (!isWorkflowActive) return false; 
+        if (!canWrite()) return false; 
         try {
             const correctInput = getWorkloadInput();
-            if (!correctInput) return false;
+            if (!correctInput || correctInput.readOnly || correctInput.disabled) return false;
 
             correctInput.focus();
-            correctInput.select(); 
-            document.execCommand('delete', false, null);
-            correctInput.value = targetVal; 
-            correctInput.dispatchEvent(new Event('input', { bubbles: true }));
-            correctInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+            // 用原型上的原生 setter 赋值，兼容框架对 value 的代理，并直接覆盖原值
+            let setOk = false;
+            try {
+                const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(correctInput), 'value');
+                if (desc && desc.set) { desc.set.call(correctInput, targetVal); setOk = true; }
+            } catch (e) {}
+            if (!setOk) correctInput.value = targetVal;
+
+            correctInput.dispatchEvent(makeEvent(correctInput, 'input'));
+            correctInput.dispatchEvent(makeEvent(correctInput, 'change'));
             correctInput.blur();
             
             if (showFlash) applyStrongFlash(correctInput.closest('.ant-input-number') || correctInput);
@@ -191,14 +446,9 @@
 
     function checkRealWorkloadStatus() {
         const input = getWorkloadInput();
-        if (!input) return false;
-        let valStr = input.value || "";
-        let ariaVal = input.getAttribute('aria-valuenow') || "";
-        let parentText = input.parentElement ? input.parentElement.innerText : "";
-        let finalStr = valStr || ariaVal || parentText;
-        let match = finalStr.match(/[\d.]+/);
-        if (!match) return false;
-        return parseFloat(match[0]) === parseFloat(userConfig.workload_val);
+        if (!input) return null;   // null = 控件未找到，区别于「值不匹配」
+        const match = (input.value || '').match(/[\d.]+/);
+        return !!match && parseFloat(match[0]) === parseFloat(userConfig.workload_val);
     }
 
     // 5. 纯动作执行流
@@ -207,10 +457,8 @@
         clickTravelCheckbox(userConfig.fill_travel, showFlash);
         clickButtonByLabelText('住宿情况', DICTS.houseType[userConfig.target_houseType], showFlash);
         
-        // 2. 🌟【调整顺序】先模拟点击“计划”项（计划内 或 计划外）
+        // 2. 点击「计划」「范围」对应选项；目标已选中或选项被禁用时会自动跳过
         clickButtonByLabelText('计划', DICTS.plan[userConfig.target_plan], showFlash);
-        
-        // 🌟【调整顺序】再模拟点击“范围”对应的合同内/合同外
         clickButtonByLabelText('范围', DICTS.fgWithinContract[userConfig.target_fgWithinContract], showFlash);
 
         // 3. 执行其余通用下拉或单选
@@ -226,54 +474,171 @@
     // 6. 状态监控数据流
     function scanRealPageStatusMatrix() {
         const matrixResults = [];
-        matrixResults.push({ name: '🚢 出差状态', status: checkTravelStatus() === userConfig.fill_travel ? '✅ 已同步' : '⚡ 差异' });
-        
-        const houseOk = checkItemStatus('住宿情况', DICTS.houseType[userConfig.target_houseType]);
-        matrixResults.push({ name: '🏨 住宿安排', status: houseOk ? '✅ 匹配成功' : '⚡ 差异' });
-        
-        // 🌟【调整监控矩阵显示位置】将合同范围放在计划类型上方
-        const scopeOk = checkItemStatus('范围', DICTS.fgWithinContract[userConfig.target_fgWithinContract]);
-        matrixResults.push({ name: '📌 合同范围', status: scopeOk ? '✅ 匹配成功' : '⚡ 差异' });
+        const push = (name, ok, okText = '✅ 匹配成功', failText = '⚡ 差异') => {
+            matrixResults.push({ name, ok, status: ok ? okText : failText });
+        };
 
-        const planOk = checkItemStatus('计划', DICTS.plan[userConfig.target_plan]);
-        matrixResults.push({ name: '📅 计划类型', status: planOk ? '✅ 匹配成功' : '⚡ 差异' });
+        // 项目本身不提供该选项（如没有「合同外」）时显示中性状态，不报差异、不触发补填
+        const pushField = (name, title, targetText) => {
+            const st = fieldStatus(title, targetText);
+            if (st === 'unavailable') matrixResults.push({ name, ok: true, status: '⏭ 项目无此选项' });
+            else push(name, st === 'ok');
+        };
+
+        const travelState = checkTravelStatus();
+        if (travelState === null) matrixResults.push({ name: '🚢 出差状态', ok: true, status: '⚠️ 未找到控件' });
+        else push('🚢 出差状态', travelState === userConfig.fill_travel, '✅ 已同步');
+        pushField('🏨 住宿安排', '住宿情况', DICTS.houseType[userConfig.target_houseType]);
+        pushField('📅 计划类型', '计划', DICTS.plan[userConfig.target_plan]);
+        pushField('📌 合同范围', '范围', DICTS.fgWithinContract[userConfig.target_fgWithinContract]);
 
         const tasks = [{ key: 'role', title: '角色', icon: '👤' }, { key: 'model', title: '方式', icon: '🌐' }, { key: 'category', title: '类别', icon: '📁' }, { key: 'result', title: '结果', icon: '🏁' }];
         tasks.forEach(task => { 
-            const isOk = checkItemStatus(task.title, DICTS[task.key][userConfig[`target_${task.key}`]]);
-            matrixResults.push({ name: `${task.icon} ${task.title}选择`, status: isOk ? '✅ 匹配成功' : '⚡ 差异' }); 
+            pushField(`${task.icon} ${task.title}选择`, task.title, DICTS[task.key][userConfig[`target_${task.key}`]]);
         });
         
-        const wlOk = checkRealWorkloadStatus();
-        matrixResults.push({ name: '⏳ 日志工时', status: wlOk ? '✅ 匹配成功' : '❌ 差异' });
-
+        const workloadState = checkRealWorkloadStatus();
+        if (workloadState === null) matrixResults.push({ name: '⏳ 日志工时', ok: true, status: '⚠️ 未找到控件' });
+        else push('⏳ 日志工时', workloadState, '✅ 匹配成功', '❌ 差异');
         return matrixResults;
     }
 
-    // 7. 中央控制流
-    function runUnifiedWorkflow(executeAction = true, showFlash = true) {
-        if (executeAction) {
-            isWorkflowActive = true; 
-            executePureFillAction(showFlash);
-        }
-        
-        setTimeout(() => {
-            const currentMatrix = scanRealPageStatusMatrix();
-            if (userConfig.auto_run || isWorkflowActive) {
-                renderUnifiedFeedbackPanel(currentMatrix);
+    // 7. 中央控制流：等子应用就绪 -> 填充 -> 多轮校验（微前端重渲染有延迟）
+    function runUnifiedWorkflow() {
+        if (_workflowRunning) { diag('WORKFLOW', '忽略重复触发'); return; }
+        _workflowRunning = true;
+        acquireWriteLock();
+        diag('WORKFLOW', '开始自动填充');
+        const stopToast = hasReadyForm() ? null : showWaitingToast();
+        waitForFormReady((ready) => {
+            let fillDone = ready;
+            try {
+                if (stopToast) stopToast();
+                diag('WORKFLOW', `表单就绪=${ready}, 可查询根=${getDOMRoots().length}`);
+                if (ready) executePureFillAction(true);
+            } catch (e) {
+                fillDone = false;   // 填充未完成，不做差异补填
+                diag('WORKFLOW', `执行异常: ${e && e.message}`);
             }
-            isWorkflowActive = false; 
-        }, 250);
+            // 必须无条件进入校验流程：防重入标记和写锁只在 verifyAndRender 末轮复位
+            verifyAndRender(0, fillDone);
+        });
     }
 
-    // 8. 特权微操释放
-    function runSingleFieldWithPrivilege(actionFn) {
-        isWorkflowActive = true; 
-        actionFn();
-        setTimeout(() => { isWorkflowActive = false; }, 50);
+    function verifyAndRender(attempt, allowRefill) {
+        setTimeout(() => {
+            const currentMatrix = scanRealPageStatusMatrix();
+            lastMatrixSnapshot = currentMatrix;
+            const allOk = currentMatrix.every(r => r.ok);
+            const isFinal = allOk || attempt >= 2;
+            diag('VERIFY', `第 ${attempt + 1} 轮: ${currentMatrix.filter(r => r.ok).length}/${currentMatrix.length} 通过${isFinal ? '（最终）' : ''}`);
+
+            // 面板不再等全部校验跑完才出现：首帧 120ms 就亮出来，
+            // 后续轮次只刷新面板里的行，不重建 DOM、不重置关闭倒计时。
+            const displayMatrix = isFinal ? currentMatrix : currentMatrix.map(r =>
+                (!r.ok && !r.status.includes('⏭') && !r.status.includes('⚠️')) ? Object.assign({}, r, { status: '⏳ 校验中' }) : r
+            );
+            // 首帧无条件渲染：旧版依赖 auto_run / 布尔锁，并发时锁被释放会静默丢掉整个面板
+            if (attempt === 0) renderUnifiedFeedbackPanel(displayMatrix);
+            else updateMatrixRows(displayMatrix);
+
+            if (!isFinal) {
+                // 第二次校验仍有差异时补一次填充（radio / 工时幂等，出差有状态判断）
+                if (allowRefill && attempt >= 1) {
+                    diag('WORKFLOW', '差异补填一次');
+                    executePureFillAction(false);
+                }
+                verifyAndRender(attempt + 1, allowRefill);
+                return;
+            }
+            _workflowRunning = false;
+            releaseWriteLock();
+        }, attempt === 0 ? 120 : 400);
+    }
+
+    // 8. 单字段联动：设置面板改选项时把改动同步到网页表单
+    //    旧实现只点一次、50ms 就释放写权限锁，微前端里事件偶发丢失就永久不生效。
+    //    现在：强制刷新容器 -> 点击 -> 严格校验 -> 失败换策略重试 -> 就地反馈，全程持锁。
+    const _flashTimers = new WeakMap();
+    function flashFieldResult(el, state) {
+        if (!el) return;
+        const prev = _flashTimers.get(el);
+        if (prev) clearTimeout(prev);
+        // 统一复位成空，避免连续操作时把上一次的红闪当成「原始样式」写回去（红框永久残留）
+        el.style.boxShadow = '';
+        const color = state === 'ok' ? '#52c41a' : (state === 'unavailable' ? '#faad14' : '#ff4d4f');
+        el.style.transition = 'box-shadow 0.25s ease';
+        el.style.boxShadow = `0 0 8px 1px ${color}`;
+        const timer = setTimeout(() => {
+            el.style.boxShadow = '';
+            el.style.transition = '';
+            _flashTimers.delete(el);
+        }, state === 'unavailable' ? 1400 : 1000);
+        _flashTimers.set(el, timer);
+    }
+
+    function runSingleFieldWithPrivilege(actionFn, verifyFn, srcEl, hintText) {
+        // 不排队：设置改动立即执行。补填轮读同一份 userConfig，最终收敛到最新选择；
+        // 极端时序下最多出现一次「⚡ 差异」，再点一次自动填充即可恢复。
+        getFormRoots(true);              // 子应用可能刚重新挂载，别用旧缓存
+        acquireWriteLock();              // 重试期间保持写权限，否则会被 guard 拦掉
+        diag('SINGLE', '单字段联动开始');
+        let attempt = 0;
+        const MAX_ATTEMPTS = 4;
+        const normalize = (v) => (v === true || v === 'ok') ? 'ok'
+            : (v === 'unavailable') ? 'unavailable' : 'retry';
+        const finish = (state) => {
+            diag('SINGLE', `结束: ${state}, 尝试 ${attempt + 1} 次`);
+            flashFieldResult(srcEl, state);
+            if (state === 'unavailable' && hintText) {
+                showFieldHint(hintText);
+            } else {
+                // 改成有效选项后别让上一条「不提供」提示继续挂着
+                const oldHint = document.getElementById('fill-field-hint');
+                if (oldHint && oldHint.parentNode) oldHint.parentNode.removeChild(oldHint);
+            }
+            releaseWriteLock();
+        };
+
+        // 预检：项目里压根没有这个选项（或选项被禁用）时一次都不点，直接中性提示，
+        // 不再当同步失败反复重试、也不再给红框。配置值照常保留。
+        const pre = normalize(verifyFn ? verifyFn() : 'ok');
+        diag('SINGLE', `预检: ${pre}`);
+        if (pre !== 'retry') { finish(pre); return; }
+
+        const step = () => {
+            // 点击抛错也要继续走校验与 finish，否则这把写锁不会释放
+            try { actionFn(attempt); } catch (e) { diag('SINGLE', `点击异常: ${e && e.message}`); }
+            setTimeout(() => {
+                const state = normalize(verifyFn ? verifyFn() : 'ok');
+                diag('SINGLE', `第 ${attempt + 1} 次校验: ${state}`);
+                if (state === 'retry' && attempt < MAX_ATTEMPTS - 1) { attempt++; step(); return; }
+                finish(state);
+            }, attempt === 0 ? 220 : 260);
+        };
+        step();
     }
 
     // 9. 状态栏面板
+    function buildRowsHTML(results) {
+        let html = '';
+        results.forEach(r => {
+            let textColor = '#52c41a';
+            if (r.status.includes('⏭')) textColor = '#8c8c8c';
+            else if (r.status.includes('⚠️')) textColor = '#faad14';
+            else if (r.status.includes('⏳')) textColor = '#1890ff';
+            else if (r.status.includes('⚡') || r.status.includes('差异') || r.status.includes('❌')) textColor = '#faad14';
+            html += `<div class="matrix-item" style="color: ${textColor};"><span>${r.name}</span><span>${r.status}</span></div>`;
+        });
+        return html;
+    }
+
+    // 校验轮次后续只刷新行内容：不重建面板、不重置关闭按钮与 3 秒倒计时
+    function updateMatrixRows(results) {
+        const rows = document.getElementById('fill-matrix-rows');
+        if (rows) rows.innerHTML = buildRowsHTML(results);
+    }
+
     function renderUnifiedFeedbackPanel(results) {
         const oldPanel = document.getElementById('fill-unified-matrix-panel'); 
         if (oldPanel && oldPanel.parentNode) oldPanel.parentNode.removeChild(oldPanel);
@@ -282,24 +647,48 @@
         panel.id = 'fill-unified-matrix-panel';
         Object.assign(panel.style, { position: 'fixed', bottom: '140px', right: '30px', backgroundColor: 'rgba(255, 255, 255, 0.98)', backdropFilter: 'blur(12px)', border: '1px solid rgba(0,0,0,0.08)', borderRadius: '12px', padding: '12px', boxShadow: '0 8px 24px rgba(0,0,0,0.15)', zIndex: '2147483646', width: '210px', display: 'flex', flexDirection: 'column', gap: '5px', transition: 'all 0.3s ease', animation: 'fillFadeIn 0.25s cubic-bezier(0.2, 0.8, 0.2, 1) forwards' });
 
-        let innerHTML = `<div style="font-size:11px; color:#999; font-weight:bold; border-bottom:1px solid #eee; padding-bottom:4px; margin-bottom:4px; display:flex; justify-content:space-between;"><span>📊 集中监控矩阵</span><span>V2.1</span></div>`;
+        let innerHTML = `<div style="font-size:11px; color:#999; font-weight:bold; border-bottom:1px solid #eee; padding-bottom:4px; margin-bottom:4px; display:flex; justify-content:space-between;"><span>📊 集中监控矩阵</span><span>V2.3.1</span></div>`;
+        innerHTML += `<div style="font-size:10px; color:#999; line-height:1.3; margin-bottom:4px;">${describeFormContainer()}</div>`;
 
-        results.forEach(r => {
-            let textColor = '#52c41a'; 
-            if (r.status.includes('⚡') || r.status.includes('差异') || r.status.includes('❌')) textColor = '#faad14'; 
-            if (r.status.includes('⏳')) textColor = '#faad14'; 
-            innerHTML += `<div class="matrix-item" style="color: ${textColor};"><span>${r.name}</span><span>${r.status}</span></div>`;
-        });
+        innerHTML += `<div id="fill-matrix-rows" style="display:flex; flex-direction:column; gap:5px;">${buildRowsHTML(results)}</div>`;
+
+        // 关闭按钮：位于「⏳ 日志工时」行下方，独占一整排
+        innerHTML += `<button id="fill-matrix-close-btn" class="fill-btn-hover" style="width:100%; box-sizing:border-box; margin-top:5px; padding:8px 0; border:none; border-radius:6px; background:#ff4d4f; color:#fff; font-size:12px; font-weight:bold; cursor:pointer; transition:all 0.2s ease;">✖ 关闭监控矩阵</button>`;
 
         panel.innerHTML = innerHTML;
         document.body.appendChild(panel);
-        setTimeout(() => {
+
+        let autoHideTimer = null;
+        let dismissed = false;
+        let clicked = false;
+        const fadeOutAndRemove = () => {
+            if (dismissed) return;
+            dismissed = true;
+            clearTimeout(autoHideTimer);
             panel.style.animation = 'fillFadeOut 0.25s cubic-bezier(0.2, 0.8, 0.2, 1) forwards';
             setTimeout(() => { if (panel && panel.parentNode) panel.parentNode.removeChild(panel); }, 250);
-        }, 4500);
+        };
+
+        const closeBtn = document.getElementById('fill-matrix-close-btn');
+        if (closeBtn) {
+            addClickEffect(closeBtn);
+            closeBtn.onmouseenter = () => { if (!clicked) closeBtn.style.background = '#d9363e'; };
+            closeBtn.onmouseleave = () => { if (!clicked) closeBtn.style.background = '#ff4d4f'; };
+            closeBtn.onclick = () => {
+                if (clicked) return;
+                clicked = true;
+                // 点击反馈：文字、颜色、缩放三重即时变化，再播放淡出
+                closeBtn.textContent = '✅ 已关闭';
+                closeBtn.style.background = '#8c8c8c';
+                closeBtn.style.transform = 'scale(0.96)';
+                clearTimeout(autoHideTimer);
+                setTimeout(fadeOutAndRemove, 120);
+            };
+        }
+        autoHideTimer = setTimeout(fadeOutAndRemove, 3000);
     }
 
-    // 关于弹窗
+    // 🌟 关于弹窗
     function showAboutModal() {
         const oldModal = document.getElementById('fill-about-modal');
         if (oldModal && oldModal.parentNode) {
@@ -338,8 +727,9 @@
             <div style="font-size: 24px; margin-bottom: 8px;">⚙️</div>
             <h3 style="margin: 0 0 12px 0; font-size: 16px; color: #111;">Bsoft 日志自动填充工具</h3>
             <div style="text-align: left; background: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; margin-bottom: 15px; display:flex; flex-direction:column; gap:6px;">
-                <div style="color:#666;">📌 <b>版本：</b><span style="color:#222; font-weight:600;">V2.1</span></div>
+                <div style="color:#666;">📌 <b>版本：</b><span style="color:#222; font-weight:600;">V2.3.1</span></div>
                 <div style="color:#444;">✍️ <b>作者：</b><span style="color:#1890ff; font-weight:bold;">IHIYA</span></div>
+                <div style="color:#444;">🔧 <b>更新：</b><span style="color:#222;">适配 /vueoffice 微前端页面</span></div>
                 <div style="color:#444; display:flex; align-items:center; gap:2px; white-space:nowrap;">
                     <span>🌐 <b>开源地址：</b></span>
                     <a href="https://github.com/wubai67-debug/Bsoft_Log_Tool" target="_blank" style="color:#1296db; text-decoration:none; font-weight:600;">点击访问 GitHub 仓库</a>
@@ -358,6 +748,65 @@
         box.onclick = (e) => e.stopPropagation(); 
     }
 
+    // 诊断导出：把常驻日志渲染成可复制文本，排障时直接发出来即可
+    function showDiagnosticPanel() {
+        const old = document.getElementById('fill-diag-modal');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
+
+        const text = buildDiagnosticReport();
+        diag('DIAG', '导出诊断日志');
+
+        const mask = document.createElement('div');
+        mask.id = 'fill-diag-modal';
+        Object.assign(mask.style, { position: 'fixed', top: '0', left: '0', width: '100vw', height: '100vh', backgroundColor: 'rgba(0,0,0,0.35)', zIndex: '2147483648', display: 'flex', alignItems: 'center', justifyContent: 'center' });
+
+        const box = document.createElement('div');
+        Object.assign(box.style, { backgroundColor: '#fff', padding: '16px', borderRadius: '12px', width: 'min(680px, 90vw)', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: '10px', boxShadow: '0 10px 30px rgba(0,0,0,0.2)' });
+        box.innerHTML = `<div style="font-size:14px; font-weight:bold; color:#111;">📋 诊断日志</div>
+            <div style="font-size:12px; color:#666; line-height:1.5;">填充不对时把下面内容全选复制发出来即可。只含容器、字段命中与状态等技术信息，不含业务数据。</div>
+            <textarea id="fill-diag-text" readonly style="width:100%; height:300px; box-sizing:border-box; font-family:monospace; font-size:11px; line-height:1.5; border:1px solid #ddd; border-radius:6px; padding:8px; resize:vertical;"></textarea>
+            <div style="display:flex; gap:8px;">
+                <button id="fill-diag-copy" style="flex:1; padding:8px; border:none; border-radius:6px; background:#1890ff; color:#fff; font-size:12px; font-weight:bold; cursor:pointer;">复制到剪贴板</button>
+                <button id="fill-diag-download" style="flex:1; padding:8px; border:1px solid #ddd; border-radius:6px; background:#fff; color:#333; font-size:12px; cursor:pointer;">下载 .txt</button>
+                <button id="fill-diag-close" style="flex:1; padding:8px; border:1px solid #ddd; border-radius:6px; background:#fff; color:#333; font-size:12px; cursor:pointer;">关闭</button>
+            </div>`;
+        mask.appendChild(box);
+        document.body.appendChild(mask);
+
+        const ta = document.getElementById('fill-diag-text');
+        ta.value = text;
+        const close = () => { if (mask.parentNode) mask.parentNode.removeChild(mask); };
+        mask.onclick = (e) => { if (e.target === mask) close(); };
+        box.onclick = (e) => e.stopPropagation();
+        document.getElementById('fill-diag-close').onclick = close;
+
+        document.getElementById('fill-diag-copy').onclick = () => {
+            const btn = document.getElementById('fill-diag-copy');
+            const done = (ok) => {
+                btn.textContent = ok ? '✅ 已复制' : '请按 Ctrl+C 复制';
+                btn.style.background = ok ? '#52c41a' : '#faad14';
+            };
+            ta.select();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(() => done(true)).catch(() => done(false));
+            } else { done(false); }
+        };
+
+        document.getElementById('fill-diag-download').onclick = () => {
+            try {
+                const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `bsoft-diag-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                if (a.parentNode) a.parentNode.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            } catch (e) { diag('DIAG', `下载失败 ${e.message}`); }
+        };
+    }
+
     // 10. 设置面板
     function toggleConfigPanel() {
         const panel = document.getElementById('fill-config-panel');
@@ -370,7 +819,7 @@
         newPanel.className = 'panel-in';
         Object.assign(newPanel.style, { position: 'fixed', bottom: '130px', right: '30px', backgroundColor: '#fff', border: '1px solid #ddd', padding: '15px', borderRadius: '12px', zIndex: '2147483647', boxShadow: '0 10px 30px rgba(0,0,0,0.15)', width: '270px' });
 
-        let html = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid #eee; padding-bottom:8px;"><h4 style="margin:0; font-size:15px; color:#111;">日志填充设置</h4><span style="font-size:10px; color:#1890ff; font-weight:bold;">V2.1</span></div>`;
+        let html = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid #eee; padding-bottom:8px;"><h4 style="margin:0; font-size:15px; color:#111;">日志填充设置</h4><span style="font-size:10px; color:#1890ff; font-weight:bold;">V2.3.1</span></div>`;
 
         const getDynamicLabel = (isOn, sec) => {
             return isOn 
@@ -418,10 +867,13 @@
                     <button id="btn_open_about" class="about-btn" style="padding-right:0;">关于我</button>
                  </div>`;
 
+        html += `<button id="btn_open_diag" style="width:100%; margin-top:10px; padding:8px; border:1px solid #d9d9d9; border-radius:6px; background:#fafafa; color:#555; font-size:12px; cursor:pointer;">📋 导出诊断日志（排障用）</button>`;
+
         newPanel.innerHTML = html;
         document.body.appendChild(newPanel);
 
         document.getElementById('btn_open_about').onclick = showAboutModal;
+        document.getElementById('btn_open_diag').onclick = showDiagnosticPanel;
 
         const chkAutoRun = document.getElementById('cfg_auto_run');
         const rangeDelay = document.getElementById('cfg_init_delay');
@@ -456,7 +908,11 @@
         document.getElementById('cfg_fill_travel').onchange = (e) => { 
             userConfig.fill_travel = e.target.checked; 
             saveConfig(); 
-            runSingleFieldWithPrivilege(() => { clickTravelCheckbox(userConfig.fill_travel, true); });
+            runSingleFieldWithPrivilege(
+                () => clickTravelCheckbox(userConfig.fill_travel, true),
+                () => checkTravelStatus() === userConfig.fill_travel,
+                e.target
+            );
         };
         
         newPanel.querySelectorAll('.auto-save-cfg').forEach(select => {
@@ -465,7 +921,13 @@
                 const title = e.target.getAttribute('data-title');
                 userConfig[`target_${id}`] = e.target.value; 
                 saveConfig(); 
-                runSingleFieldWithPrivilege(() => { clickButtonByLabelText(title, DICTS[id][userConfig[`target_${id}`]], true); });
+                const targetText = DICTS[id][userConfig[`target_${id}`]];
+                runSingleFieldWithPrivilege(
+                    (attempt) => clickButtonByLabelText(title, targetText, attempt === 0, attempt),
+                    () => fieldStatus(title, targetText),
+                    e.target,
+                    `📌 ${title}：当前项目不提供「${targetText}」选项，已跳过（配置已保留）`
+                );
             };
         });
 
@@ -475,17 +937,21 @@
             let num = parseFloat(e.target.value); 
             let formatted = (isNaN(num) ? 8.0 : num).toFixed(1); 
             e.target.value = formatted; userConfig.workload_val = formatted; saveConfig(); 
-            runSingleFieldWithPrivilege(() => { fillWorkloadViaButtons(formatted, true); });
+            runSingleFieldWithPrivilege(
+                () => fillWorkloadViaButtons(formatted, true),
+                () => checkRealWorkloadStatus(),
+                e.target
+            );
         };
         document.getElementById('btn_wl_minus').onclick = () => { 
             let res = (Math.max(0, parseFloat(userConfig.workload_val) - 1.0)).toFixed(1); 
             wlInput.value = res; userConfig.workload_val = res; saveConfig(); 
-            runSingleFieldWithPrivilege(() => { fillWorkloadViaButtons(res, true); });
+            runSingleFieldWithPrivilege(() => fillWorkloadViaButtons(res, true), () => checkRealWorkloadStatus(), wlInput);
         };
         document.getElementById('btn_wl_plus').onclick = () => { 
             let res = (parseFloat(userConfig.workload_val) + 1.0).toFixed(1); 
             wlInput.value = res; userConfig.workload_val = res; saveConfig(); 
-            runSingleFieldWithPrivilege(() => { fillWorkloadViaButtons(res, true); });
+            runSingleFieldWithPrivilege(() => fillWorkloadViaButtons(res, true), () => checkRealWorkloadStatus(), wlInput);
         };
     }
 
@@ -503,7 +969,7 @@
         Object.assign(cfgBtn.style, { padding: '0 12px', backgroundColor: 'transparent', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '18px' });
         addClickEffect(mainBtn); addClickEffect(cfgBtn);
         
-        mainBtn.onclick = () => { runUnifiedWorkflow(true, true); };
+        mainBtn.onclick = () => { runUnifiedWorkflow(); };
         cfgBtn.onclick = toggleConfigPanel;
         group.appendChild(mainBtn); group.appendChild(cfgBtn);
         document.body.appendChild(group);
@@ -513,12 +979,13 @@
 
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
         chrome.storage.local.get(['logFillConfig_v7'], function(result) {
-            if (result && result.logFillConfig_v7) { 
-                userConfig = result.logFillConfig_v7; 
+            if (result && result.logFillConfig_v7) {
+                // 合并默认值：旧版本存下来的配置可能缺新增字段，避免读到 undefined
+                userConfig = Object.assign({}, userConfig, result.logFillConfig_v7);
             }
             if (userConfig.auto_run) {
-                setTimeout(() => { 
-                    runUnifiedWorkflow(true, true); 
+                setTimeout(() => {
+                    runUnifiedWorkflow();
                 }, (userConfig.init_delay + 0.3) * 1000);
             }
         });
