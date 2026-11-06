@@ -66,14 +66,13 @@
     // 两者最终收敛到用户最新选择；排队只会增加状态机和「永久卡住」的风险。
 
     // ==========================================================================
-    // 【V2.2 核心】微前端(无界 wujie)适配层
+    // 【V2.2 核心】隔离文档容器适配层
     //
-    // 新地址 /vueoffice/:path 是 Vue3 + Vite 外壳，通过 WujieVue 把旧的
-    // vue-antd-pro 子应用(/office/#/:path)挂载到 <wujie-app> 的 Shadow DOM。
-    // document.querySelectorAll 不会穿透 shadowRoot，所以 V2.1 的点击和状态
-    // 扫描全部落空 -> 面板全提示「⚡ 差异」。
-    // 这里统一收集所有可查询的文档根，表单操作只在含 ant 表单的根内进行。
-    // 兼容：新微前端页 / 旧地址直连 / wujie 降级(iframe)模式。
+    // 新版日志页把表单挂在隔离的文档容器里，主文档的选择器无法直接命中，
+    // 旧版的点击与状态扫描全部落空 -> 面板清一色「⚡ 差异」。
+    // 这里统一收集所有可查询的文档根（含开放 Shadow DOM 与同源 iframe），
+    // 表单操作只在真正含表单的根内进行，避免误点外层页面元素。
+    // 同时兼容旧版页面直连与 iframe 套壳模式。
     // ==========================================================================
     let _rootCache = null, _rootCacheTime = 0;
     let _formRootCache = null, _formRootCacheTime = 0;
@@ -85,7 +84,7 @@
         const push = (r) => { if (r && !seen.has(r)) { seen.add(r); roots.push(r); } };
         push(document);
 
-        // 递归收集所有 open shadowRoot（wujie-app 及其它自定义元素）
+        // 递归收集所有开放 shadowRoot（自定义元素挂载的隔离容器）
         const scanHosts = (root, depth) => {
             if (depth > 3 || !root || !root.querySelectorAll) return;
             let nodes = [];
@@ -97,7 +96,7 @@
         };
         scanHosts(document, 0);
 
-        // 同源 iframe（wujie 降级模式 / 其它 iframe 套壳）
+        // 同源 iframe（降级模式 / 其它 iframe 套壳）
         let frames = [];
         try { frames = document.querySelectorAll('iframe'); } catch (e) {}
         for (let i = 0; i < frames.length; i++) {
@@ -125,7 +124,7 @@
         return out;
     }
 
-    // 只操作真正含表单的文档根，避免误点 Vue3 外壳上的菜单/按钮
+    // 只操作真正含表单的文档根，避免误点外层页面上的菜单/按钮
     function getFormRoots(force = false) {
         if (!force && _formRootCache && Date.now() - _formRootCacheTime < 300) return _formRootCache;
         const all = getDOMRoots(force);
@@ -139,8 +138,8 @@
         return result;
     }
 
-    // 探测真正含 ant 表单的文档根，供「等待就绪」与「容器说明」共用，
-    // 覆盖主文档 / 所有 open Shadow DOM / 同源 iframe（wujie 降级模式）
+    // 探测真正含表单的文档根，供「等待就绪」与「容器说明」共用，
+    // 覆盖主文档 / 所有开放 Shadow DOM / 同源 iframe
     function detectFormRoots() {
         return getDOMRoots(true).filter(r => {
             try { return !!r.querySelector('.ant-form-item'); } catch (e) { return false; }
@@ -160,7 +159,7 @@
         tick();
     }
 
-    // Shadow DOM 内的事件必须 composed 才能冒泡到子应用代理的 document
+    // 隔离容器内的事件必须 composed 才能冒泡到外层文档
     function makeEvent(el, type) {
         let win = window;
         try { win = (el && el.ownerDocument && el.ownerDocument.defaultView) || window; } catch (e) {}
@@ -284,7 +283,7 @@
     function describeFormContainer() {
         const roots = detectFormRoots();
         if (!roots.length) return '🔍 容器：未检测到日志表单';
-        if (roots.some(r => r !== document)) return '🔍 容器：微前端 Shadow DOM';
+        if (roots.some(r => r !== document)) return '🔍 容器：隔离文档容器';
         return '🔍 容器：当前页面文档';
     }
 
@@ -729,10 +728,10 @@
             <div style="text-align: left; background: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; margin-bottom: 15px; display:flex; flex-direction:column; gap:6px;">
                 <div style="color:#666;">📌 <b>版本：</b><span style="color:#222; font-weight:600;">V2.3.1</span></div>
                 <div style="color:#444;">✍️ <b>作者：</b><span style="color:#1890ff; font-weight:bold;">IHIYA</span></div>
-                <div style="color:#444;">🔧 <b>更新：</b><span style="color:#222;">适配 /vueoffice 微前端页面</span></div>
+                <div style="color:#444;">🔧 <b>更新：</b><span style="color:#222;">适配新版隔离容器页面</span></div>
                 <div style="color:#444; display:flex; align-items:center; gap:2px; white-space:nowrap;">
                     <span>🌐 <b>开源地址：</b></span>
-                    <a href="https://github.com/wubai67-debug/Bsoft_Log_Tool" target="_blank" style="color:#1296db; text-decoration:none; font-weight:600;">点击访问 GitHub 仓库</a>
+                    <a href="https://github.com/IHIYA567/Bsoft_Log_Tool" target="_blank" style="color:#1296db; text-decoration:none; font-weight:600;">点击访问 GitHub 仓库</a>
                 </div>
             </div>
             <button id="fill-modal-close-btn" style="width: 100%; padding: 8px; border: none; background: #1890ff; color: #fff; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: bold;">确 定</button>
